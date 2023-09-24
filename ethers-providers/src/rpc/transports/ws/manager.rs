@@ -6,6 +6,7 @@ use super::{
     WsClient, WsClientError,
 };
 use crate::JsonRpcError;
+use async_recursion::async_recursion;
 use ethers_core::types::U256;
 use futures_channel::{mpsc, oneshot};
 use futures_util::{select_biased, StreamExt};
@@ -16,7 +17,9 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
+    time::Duration,
 };
+use tokio::time::sleep;
 
 pub type SharedChannelMap = Arc<Mutex<HashMap<U256, mpsc::UnboundedReceiver<Box<RawValue>>>>>;
 
@@ -79,7 +82,7 @@ impl SubscriptionManager {
                     channel,
                 };
                 // reuse the RPC ID. this is somewhat dirty.
-                return unsub_request.serialize_raw(id).ok()
+                return unsub_request.serialize_raw(id).ok();
             }
             tracing::trace!("No current server id");
         }
@@ -98,7 +101,7 @@ impl SubscriptionManager {
                 server_id = format!("0x{server_id:x}"),
                 "No aliased subscription found"
             );
-            return
+            return;
         }
         let id = id_opt.unwrap();
 
@@ -198,6 +201,7 @@ pub struct RequestManager {
     backend: BackendDriver,
     // The URL and optional auth info for the connection
     conn: ConnectionDetails,
+    #[allow(dead_code)]
     #[cfg(not(target_arch = "wasm32"))]
     // An Option wrapping a tungstenite WebsocketConfig. If None, the default config is used.
     config: Option<WebSocketConfig>,
@@ -332,6 +336,7 @@ impl RequestManager {
         WsBackend::connect(self.conn.clone()).await
     }
 
+    #[allow(dead_code)]
     #[cfg(not(target_arch = "wasm32"))]
     async fn reconnect_backend(&mut self) -> Result<(WsBackend, BackendDriver), WsClientError> {
         if let Some(config) = self.config {
@@ -341,60 +346,70 @@ impl RequestManager {
         }
     }
 
+    #[async_recursion]
     async fn reconnect(&mut self) -> Result<(), WsClientError> {
         if self.reconnects == 0 {
-            return Err(WsClientError::TooManyReconnects)
+            return Err(WsClientError::TooManyReconnects);
         }
         self.reconnects -= 1;
 
+        sleep(Duration::from_millis(2000)).await;
+
         tracing::info!(remaining = self.reconnects, url = self.conn.url, "Reconnecting to backend");
+
         // create the new backend
-        let (s, mut backend) = self.reconnect_backend().await?;
+        return match WsBackend::connect(self.conn.clone()).await {
+            Ok((s, mut backend)) => {
+                // spawn the new backend
+                s.spawn();
 
-        // spawn the new backend
-        s.spawn();
+                // swap out the backend
+                std::mem::swap(&mut self.backend, &mut backend);
 
-        // swap out the backend
-        std::mem::swap(&mut self.backend, &mut backend);
+                // rename for clarity
+                let mut old_backend = backend;
 
-        // rename for clarity
-        let mut old_backend = backend;
+                // Drain anything in the backend
+                tracing::debug!("Draining old backend to_handle channel");
+                while let Some(to_handle) = old_backend.to_handle.next().await {
+                    self.handle(to_handle);
+                }
 
-        // Drain anything in the backend
-        tracing::debug!("Draining old backend to_handle channel");
-        while let Some(to_handle) = old_backend.to_handle.next().await {
-            self.handle(to_handle);
-        }
+                // issue a shutdown command (even though it's likely gone)
+                old_backend.shutdown();
 
-        // issue a shutdown command (even though it's likely gone)
-        old_backend.shutdown();
+                tracing::debug!(count = self.subs.count(), "Re-starting active subscriptions");
+                let req_cnt = self.reqs.len();
 
-        tracing::debug!(count = self.subs.count(), "Re-starting active subscriptions");
-        let req_cnt = self.reqs.len();
+                // reissue subscriptions
+                for (id, sub) in self.subs.to_reissue() {
+                    let (tx, _rx) = oneshot::channel();
+                    let in_flight = InFlight {
+                        method: "eth_subscribe".to_string(),
+                        params: sub.params.clone(),
+                        channel: tx,
+                    };
+                    // Need an entry in reqs to ensure response with new server sub ID is processed
+                    self.reqs.insert(*id, in_flight);
+                }
 
-        // reissue subscriptions
-        for (id, sub) in self.subs.to_reissue() {
-            let (tx, _rx) = oneshot::channel();
-            let in_flight = InFlight {
-                method: "eth_subscribe".to_string(),
-                params: sub.params.clone(),
-                channel: tx,
-            };
-            // Need an entry in reqs to ensure response with new server sub ID is processed
-            self.reqs.insert(*id, in_flight);
-        }
+                tracing::debug!(count = req_cnt, "Re-issuing pending requests");
+                // reissue requests, including the re-subscription requests we just added above
+                for (id, req) in self.reqs.iter() {
+                    self.backend
+                        .dispatcher
+                        .unbounded_send(req.serialize_raw(*id)?)
+                        .map_err(|_| WsClientError::DeadChannel)?;
+                }
+                tracing::info!(subs = self.subs.count(), reqs = req_cnt, "Re-connection complete");
 
-        tracing::debug!(count = req_cnt, "Re-issuing pending requests");
-        // reissue requests, including the re-subscription requests we just added above
-        for (id, req) in self.reqs.iter() {
-            self.backend
-                .dispatcher
-                .unbounded_send(req.serialize_raw(*id)?)
-                .map_err(|_| WsClientError::DeadChannel)?;
-        }
-        tracing::info!(subs = self.subs.count(), reqs = req_cnt, "Re-connection complete");
-
-        Ok(())
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Error reconnecting to backend");
+                self.reconnect().await
+            }
+        };
     }
 
     #[tracing::instrument(skip(self, result))]

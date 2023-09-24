@@ -69,6 +69,7 @@ impl WsBackend {
         Ok(Self::new(ws))
     }
 
+    #[allow(dead_code)]
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn connect_with_config(
         details: ConnectionDetails,
